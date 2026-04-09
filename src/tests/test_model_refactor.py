@@ -32,8 +32,8 @@ ATOL = 1e-4
 RTOL = 1e-4
 
 
-def load_model(migrate_weights=False):
-    """Load RETR model. Set migrate_weights=True after transformer.py refactor."""
+def load_model(migrate_weights=True):
+    """Load RETR model. migrate_weights is always True (model is permanently refactored)."""
     from models import RETR
     model = RETR(task="SEG")
     params = torch.load(CKPT, map_location="cpu")
@@ -116,8 +116,8 @@ def tensors_from_out(out):
 
 
 def save_reference():
-    print("Loading pre-refactor model to save reference outputs...")
-    model = load_model(migrate_weights=False)
+    print("Loading model (with weight migration) to save reference outputs...")
+    model = load_model(migrate_weights=True)
     rf_hor, rf_ver = make_inputs()
 
     with torch.no_grad():
@@ -139,7 +139,7 @@ def verify_refactor():
     if not REF_FILE.exists():
         raise FileNotFoundError(f"Run --save first: {REF_FILE}")
 
-    print("Loading refactored model (with weight migration)...")
+    print("Loading model (with weight migration) to verify against reference...")
     model = load_model(migrate_weights=True)
     ref = torch.load(REF_FILE, map_location="cpu")
     rf_hor, rf_ver = ref["rf_hor"], ref["rf_ver"]
