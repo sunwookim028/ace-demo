@@ -1,0 +1,36 @@
+# Copyright (C) 2024 Mitsubishi Electric Research Laboratories (MERL)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Conda environment for PTQ experiments on RETR.
+# Separate from the baseline 'retr' environment (PyTorch 2.0).
+#
+# Create:  conda env create -f environment.yml
+# Activate: conda activate retr-quant
+
+name: retr-quant
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # PyTorch >= 2.4 required for torchao compatibility
+  - pytorch>=2.4
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip:
+    - torchao>=0.6
+    - opencv-python
+    - tqdm
+    - scikit-image
+    - matplotlib
+    - pymanopt
+    - torchmetrics
+    - pycocotools
+    - numpy==1.26.4
