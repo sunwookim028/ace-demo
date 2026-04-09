@@ -169,10 +169,20 @@ Radar-plane equivalents (`det_rad`) are computed but not reported in the paper t
 
 **Pretrained baselines** (ResNet18 backbone, `logs/pretrained_model/`):
 
+GPU baseline (original paper, `retr` env, PyTorch 2.0):
+
 | Split | BBox AP | BBox AR1 | Segm IoU | Checkpoint |
 |-------|---------|----------|----------|------------|
 | **P2S1** | **46.75** | **42.19** | **77.21** | `p2s1_retr_detseg.pth` (156 MB) |
 | P2S2 | 12.19 | 19.70 | 59.93 | `p2s2_retr_detseg.pth` (156 MB) |
+
+CPU baseline (`retr-quant` env, PyTorch 2.4, `eval_ptq.py`):
+
+| Split | BBox AP | BBox AR1 | Segm IoU |
+|-------|---------|----------|----------|
+| **P2S1** | **42.78** | **39.79** | **74.41** |
+
+> CPU results differ from GPU due to floating-point ordering in matmul. All quantization experiments use the CPU baseline for relative comparisons.
 
 ---
 

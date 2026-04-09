@@ -171,9 +171,12 @@ Each JSON in `experiments/results/` has the following structure:
 
 **Baseline reference values (P2S1, FP32):**
 
-| `bbox_ap` | `bbox_ar1` | `seg_iou` |
-|-----------|-----------|----------|
-| 46.75 | 42.19 | 77.21 |
+| Environment | `bbox_ap` | `bbox_ar1` | `seg_iou` |
+|------------|-----------|-----------|----------|
+| GPU (original paper, `retr` env) | 46.75 | 42.19 | 77.21 |
+| CPU (`retr-quant` env, PyTorch 2.4) | **42.78** | **39.79** | **74.41** |
+
+> Note: CPU floating-point arithmetic differs from GPU. All `eval_ptq.py` runs use CPU results as the baseline for quantization comparisons.
 
 **Model size reference:**
 
@@ -217,7 +220,7 @@ conda run -n retr python src/tests/test_model_refactor.py --verify
 # Expected: PASS — refactored model is numerically equivalent to original.
 ```
 
-The test compares per-output-key tensors with `atol=rtol=1e-4`. The current refactor passes with `max_abs=0.00e+00` (exact match in float32).
+The test compares per-output-key tensors with `atol=rtol=1e-4`. The current refactor passes with `max_abs=0.00e+00` (exact match in float32, CPU, PyTorch 2.4).
 
 ---
 
