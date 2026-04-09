@@ -37,7 +37,9 @@ done
 
 run() {
     echo ">>> $*"
-    [[ $DRY_RUN -eq 0 ]] && python "$SRC/eval_ptq.py" "$@"
+    if [[ $DRY_RUN -eq 0 ]]; then
+        ~/miniforge3/bin/conda run -n retr-quant --cwd "$SRC" python eval_ptq.py "$@"
+    fi
 }
 
 COMMON=(
@@ -56,7 +58,12 @@ COMMON=(
 run "${COMMON[@]}"
 
 # ------------------------------------------------------------------
-# 2. INT8 weight-only — per component
+# 2. BF16 (full model)
+# ------------------------------------------------------------------
+run "${COMMON[@]}" --scheme bf16 --component all
+
+# ------------------------------------------------------------------
+# 3. INT8 weight-only — per component
 # ------------------------------------------------------------------
 for COMP in backbone encoder decoder transformer ffn proj all; do
     run "${COMMON[@]}" --scheme int8wo --component "$COMP"

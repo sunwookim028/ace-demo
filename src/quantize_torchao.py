@@ -32,9 +32,19 @@ Design notes
   This is a *simulation* of INT8 activation quantization (straight-through
   estimator); it measures accuracy impact without hardware INT8 matmul speed.
 
-* Encoder self_attn uses standard nn.MultiheadAttention with fused in_proj_weight.
-  torchao quantizes its in_proj_weight as a single [1536, 512] linear.
-  Activation hooks are NOT applied to the encoder (standard MHA, different path).
+* Encoder self_attn: the original fused nn.MultiheadAttention (in_proj_weight
+  [1536, 512]) has been replaced in transformer.py with explicit nn.Linear
+  modules (self_attn_q_proj, self_attn_k_proj, self_attn_v_proj,
+  self_attn_out_proj) using F.multi_head_attention_forward with
+  use_separate_proj_weight=True.  torchao covers all four naturally via the
+  standard filter_fn path.  Checkpoints are migrated by
+  migrate_encoder_mha_state_dict() at load time.
+
+* BF16 scheme: applies torch.bfloat16 dtype conversion to the full model.
+  Component-level BF16 is not supported because activation dtype mismatches at
+  module boundaries cause runtime errors; full-model conversion is the standard
+  approach (cf. model.to(torch.bfloat16) in HuggingFace inference).
+  Inputs must also be cast to bfloat16 before forward — handled in eval_ptq.py.
 
 * Layers NOT quantized: detection/segmentation heads, nn.LayerNorm, nn.GroupNorm,
   nn.Embedding (query_embed).  These are small or directly output-sensitive.
@@ -45,9 +55,9 @@ import torch.nn as nn
 
 try:
     from torchao.quantization import (
-        int4_weight_only,
-        int8_dynamic_activation_int8_weight,
-        int8_weight_only,
+        Int4WeightOnlyConfig,
+        Int8DynamicActivationInt8WeightConfig,
+        Int8WeightOnlyConfig,
         quantize_,
     )
 except ImportError as e:
@@ -63,12 +73,15 @@ from models.module_retr.attention import MultiheadAttention as CustomMHA
 # ---------------------------------------------------------------------------
 
 SCHEMES = {
-    "int8wo": int8_weight_only(),
-    "int4wo_g128": int4_weight_only(group_size=128),
-    "int4wo_g64": int4_weight_only(group_size=64),
-    "int4wo_g32": int4_weight_only(group_size=32),
-    "int8dq": int8_dynamic_activation_int8_weight(),
+    "bf16": "bf16",  # sentinel — handled as dtype conversion, not torchao
+    "int8wo": Int8WeightOnlyConfig(),
+    "int4wo_g128": Int4WeightOnlyConfig(group_size=128),
+    "int4wo_g64": Int4WeightOnlyConfig(group_size=64),
+    "int4wo_g32": Int4WeightOnlyConfig(group_size=32),
+    "int8dq": Int8DynamicActivationInt8WeightConfig(),
 }
+
+DTYPE_SCHEMES = {"bf16"}  # schemes that use dtype conversion instead of torchao
 
 # ---------------------------------------------------------------------------
 # Component filter functions
@@ -77,12 +90,17 @@ SCHEMES = {
 # torchao calls filter_fn(module, full_qualified_name) for every leaf module.
 
 def _is_backbone(mod: nn.Module, fqn: str) -> bool:
-    """ResNet18 Conv2d layers + input_proj in RETR (retr.py level)."""
-    # retr.backbone.*  and  retr.input_proj / retr.input_proj_ver
+    """ResNet18 + input_proj linear layers only.
+
+    NOTE: torchao 0.17.0 has a shape-mismatch bug when applying per-channel
+    INT8 to 1×1 Conv2d (scale.view([out,in,1,1]) fails for size-1 scale).
+    All backbone Conv2d layers are excluded until this is resolved upstream.
+    The backbone has no nn.Linear layers (all Conv2d), so this filter currently
+    matches nothing — backbone quantization is a no-op for INT8/INT4 schemes.
+    """
     return (
-        isinstance(mod, (nn.Conv2d, nn.Linear))
+        isinstance(mod, nn.Linear)
         and ("backbone" in fqn or "input_proj" in fqn)
-        # exclude detection/seg heads that also contain 'proj'
         and "class_embed" not in fqn
         and "bbox_embed" not in fqn
         and "seg" not in fqn.lower()
@@ -90,21 +108,17 @@ def _is_backbone(mod: nn.Module, fqn: str) -> bool:
 
 
 def _is_encoder(mod: nn.Module, fqn: str) -> bool:
-    """All Linear/Conv2d inside transformer encoder layers."""
-    return (
-        isinstance(mod, (nn.Linear, nn.Conv2d))
-        and "transformer" in fqn
-        and "encoder" in fqn
-    )
+    """All Linear layers inside the transformer encoder layers.
+    (Module path: model.detr.encoder.layers.N.*)
+    """
+    return isinstance(mod, nn.Linear) and "encoder" in fqn
 
 
 def _is_decoder(mod: nn.Module, fqn: str) -> bool:
-    """All Linear/Conv2d inside transformer decoder layers."""
-    return (
-        isinstance(mod, (nn.Linear, nn.Conv2d))
-        and "transformer" in fqn
-        and "decoder" in fqn
-    )
+    """All Linear layers inside the transformer decoder layers.
+    (Module path: model.detr.decoder.layers.N.* and decoder.query_scale/ref_point_head)
+    """
+    return isinstance(mod, nn.Linear) and "decoder" in fqn
 
 
 def _is_transformer(mod: nn.Module, fqn: str) -> bool:
@@ -116,7 +130,7 @@ def _is_ffn(mod: nn.Module, fqn: str) -> bool:
     """Feed-forward (linear1 / linear2) inside encoder and decoder."""
     return (
         isinstance(mod, nn.Linear)
-        and "transformer" in fqn
+        and ("encoder" in fqn or "decoder" in fqn)
         and ("linear1" in fqn or "linear2" in fqn)
     )
 
@@ -142,8 +156,63 @@ COMPONENT_FILTERS = {
 }
 
 # ---------------------------------------------------------------------------
+# Checkpoint key migration
+# ---------------------------------------------------------------------------
+
+def migrate_encoder_mha_state_dict(state_dict: dict) -> dict:
+    """
+    Remap checkpoint keys from the original fused nn.MultiheadAttention encoder
+    self_attn to the refactored explicit Q/K/V Linear modules in
+    ConditionalTransformerEncoderLayer (transformer.py).
+
+    Original keys (per encoder layer N):
+        model.detr.encoder.layers.N.self_attn.in_proj_weight  [1536, 512]
+        model.detr.encoder.layers.N.self_attn.in_proj_bias    [1536]
+        model.detr.encoder.layers.N.self_attn.out_proj.weight [512, 512]
+        model.detr.encoder.layers.N.self_attn.out_proj.bias   [512]
+
+    New keys (refactored):
+        model.detr.encoder.layers.N.self_attn_q_proj.weight   [512, 512]
+        model.detr.encoder.layers.N.self_attn_q_proj.bias     [512]
+        model.detr.encoder.layers.N.self_attn_k_proj.weight   [512, 512]
+        model.detr.encoder.layers.N.self_attn_k_proj.bias     [512]
+        model.detr.encoder.layers.N.self_attn_v_proj.weight   [512, 512]
+        model.detr.encoder.layers.N.self_attn_v_proj.bias     [512]
+        model.detr.encoder.layers.N.self_attn_out_proj.weight [512, 512]
+        model.detr.encoder.layers.N.self_attn_out_proj.bias   [512]
+    """
+    new_sd = {}
+    for key, val in state_dict.items():
+        if "encoder" not in key or "self_attn" not in key:
+            new_sd[key] = val
+            continue
+
+        prefix = key.rsplit("self_attn", 1)[0]  # e.g. 'model.detr.encoder.layers.0.'
+
+        if key.endswith(".self_attn.in_proj_weight"):
+            d = val.shape[0] // 3
+            new_sd[prefix + "self_attn_q_proj.weight"] = val[0:d].clone()
+            new_sd[prefix + "self_attn_k_proj.weight"] = val[d:2*d].clone()
+            new_sd[prefix + "self_attn_v_proj.weight"] = val[2*d:3*d].clone()
+        elif key.endswith(".self_attn.in_proj_bias"):
+            d = val.shape[0] // 3
+            new_sd[prefix + "self_attn_q_proj.bias"] = val[0:d].clone()
+            new_sd[prefix + "self_attn_k_proj.bias"] = val[d:2*d].clone()
+            new_sd[prefix + "self_attn_v_proj.bias"] = val[2*d:3*d].clone()
+        elif key.endswith(".self_attn.out_proj.weight"):
+            new_sd[prefix + "self_attn_out_proj.weight"] = val
+        elif key.endswith(".self_attn.out_proj.bias"):
+            new_sd[prefix + "self_attn_out_proj.bias"] = val
+        else:
+            new_sd[key] = val
+
+    return new_sd
+
+
+# ---------------------------------------------------------------------------
 # Main PTQ entry point
 # ---------------------------------------------------------------------------
+
 
 def apply_ptq(model: nn.Module, scheme: str, component: str) -> nn.Module:
     """
@@ -166,9 +235,23 @@ def apply_ptq(model: nn.Module, scheme: str, component: str) -> nn.Module:
     if component not in COMPONENT_FILTERS:
         raise ValueError(f"Unknown component '{component}'. Choose from: {list(COMPONENT_FILTERS)}")
 
+    # BF16: use torch.autocast rather than model.to(bfloat16).
+    # transformer.py has hardcoded dtype=torch.float32 in positional encodings;
+    # model.to(bfloat16) causes dtype mismatches at those boundaries.
+    # autocast handles mixed-dtype ops transparently — the standard approach
+    # (used by HuggingFace, PyTorch docs) for BF16 inference.
+    # Model weights stay float32; autocast casts eligible ops to bfloat16 on the fly.
+    # The eval_ptq.py forward loop wraps in torch.autocast when scheme == "bf16".
+    if scheme in DTYPE_SCHEMES:
+        if component != "all":
+            raise ValueError(
+                f"scheme='{scheme}' requires component='all' — autocast applies "
+                "globally; per-component BF16 is not supported."
+            )
+        return model  # no model mutation; autocast is applied in eval_ptq.py
+
     quant_config = SCHEMES[scheme]
     filter_fn = COMPONENT_FILTERS[component]
-
     quantize_(model, quant_config, filter_fn=filter_fn)
     return model
 
@@ -246,10 +329,24 @@ def register_attention_act_quant_hooks(
 # ---------------------------------------------------------------------------
 
 def model_size_mb(model: nn.Module) -> float:
-    """Total parameter + buffer memory in MB (approximate)."""
+    """Total parameter + buffer memory in MB (approximate).
+
+    Handles torchao AffineQuantizedTensor weights by summing their actual
+    int_data + scale storage rather than the logical float32 size.
+    """
+    try:
+        from torchao.dtypes import AffineQuantizedTensor
+    except ImportError:
+        AffineQuantizedTensor = None
+
     total = 0
     for p in model.parameters():
-        total += p.nelement() * p.element_size()
+        if AffineQuantizedTensor is not None and isinstance(p, AffineQuantizedTensor):
+            impl = p.tensor_impl
+            total += impl.int_data.nelement() * impl.int_data.element_size()
+            total += impl.scale.nelement() * impl.scale.element_size()
+        else:
+            total += p.nelement() * p.element_size()
     for b in model.buffers():
         total += b.nelement() * b.element_size()
     return total / (1024 ** 2)

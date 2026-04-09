@@ -341,6 +341,7 @@ def multi_head_attention_forward(
                 v_proj_weight=v_proj_weight,
                 static_k=static_k,
                 static_v=static_v,
+                out_dim=out_dim,
             )
     tgt_len, bsz, embed_dim = query.size()
     assert embed_dim == embed_dim_to_check

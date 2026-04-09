@@ -34,6 +34,7 @@ Notes
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,16 +43,21 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-# Allow importing from src/
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# det_seg_dataset.py hardcodes "./utils/data_split.npz" relative to CWD.
+# test.py is designed to be run from src/. We enforce that here.
+_SRC_DIR = Path(__file__).resolve().parent
+os.chdir(_SRC_DIR)
+sys.path.insert(0, str(_SRC_DIR))
 
 from data.dataloader import collate_det_seg, get_dataloader
 from data.det_seg_dataset import MMVRDetSeg
 from models import RETR
 from quantize_torchao import (
     COMPONENT_FILTERS,
+    DTYPE_SCHEMES,
     SCHEMES,
     apply_ptq,
+    migrate_encoder_mha_state_dict,
     model_size_mb,
     register_attention_act_quant_hooks,
 )
@@ -115,6 +121,7 @@ def main(args):
     task_internal = "SEG" if args.task == "DETSEG" else "DET"
     model = RETR(task=task_internal).to(device)
     params = torch.load(args.pretrained_path, map_location=device)
+    params = migrate_encoder_mha_state_dict(params)
     model.load_state_dict(params)
     model.eval()
 
@@ -145,6 +152,12 @@ def main(args):
     metrics = Metrics(seg=(task_internal == "SEG")).to(device)
 
     latencies = []
+    use_autocast = args.scheme in DTYPE_SCHEMES
+    autocast_ctx = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if use_autocast else torch.autocast(device_type=device.type, enabled=False)
+    )
+
     model.eval()
     with torch.no_grad():
         for batch in tqdm(test_loader, desc=build_run_name(args)):
@@ -154,7 +167,8 @@ def main(args):
             labels = batch["labels"]
 
             t0 = time.perf_counter()
-            out = model(rf_hor, rf_ver)
+            with autocast_ctx:
+                out = model(rf_hor, rf_ver)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             latencies.append((time.perf_counter() - t0) / rf_hor.shape[0])

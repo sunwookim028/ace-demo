@@ -31,7 +31,7 @@ class MLP(nn.Module):
 
 def gen_sineembed_for_position(pos_tensor):
     scale = 2 * math.pi
-    dim_t = torch.arange(128, dtype=torch.float32, device=pos_tensor.device)
+    dim_t = torch.arange(128, dtype=pos_tensor.dtype, device=pos_tensor.device)
     dim_t = 10000 ** (2 * (dim_t // 2) / 128)
     x_embed = pos_tensor[:, :, 0] * scale
     y_embed = pos_tensor[:, :, 1] * scale
@@ -47,9 +47,9 @@ def gen_sineembed_for_3d_position(pos_tensor):
     scale = 2 * math.pi
     sum_dim = 256
     dim = 86
-    dim_t_x = torch.arange(dim, dtype=torch.float32, device=pos_tensor.device)
-    dim_t_y = torch.arange(dim, dtype=torch.float32, device=pos_tensor.device)
-    dim_t_z = torch.arange(dim, dtype=torch.float32, device=pos_tensor.device)
+    dim_t_x = torch.arange(dim, dtype=pos_tensor.dtype, device=pos_tensor.device)
+    dim_t_y = torch.arange(dim, dtype=pos_tensor.dtype, device=pos_tensor.device)
+    dim_t_z = torch.arange(dim, dtype=pos_tensor.dtype, device=pos_tensor.device)
     dim_t_x = 10000 ** (3 * (dim_t_x // 3) / dim)
     dim_t_y = 10000 ** (3 * (dim_t_y // 3) / dim)
     dim_t_z = 10000 ** (3 * (dim_t_z // 3) / dim)
@@ -108,7 +108,13 @@ class ConditionalTransformerEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.nhead = nhead
-        self.self_attn = nn.MultiheadAttention(d_model * 2, nhead, dropout=dropout)
+        _sa_dim = d_model * 2
+        self.self_attn_q_proj = nn.Linear(_sa_dim, _sa_dim)
+        self.self_attn_k_proj = nn.Linear(_sa_dim, _sa_dim)
+        self.self_attn_v_proj = nn.Linear(_sa_dim, _sa_dim)
+        self.self_attn_out_proj = nn.Linear(_sa_dim, _sa_dim)
+        self.self_attn_nhead = nhead
+        self.self_attn_dropout = dropout
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -160,9 +166,31 @@ class ConditionalTransformerEncoderLayer(nn.Module):
     ):
         _, _, n_model = src.shape
         q, k, v = self.with_pos_concat(src, src, src, pos, pos, pos)
-        src2 = self.self_attn(q, k, value=v, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0][
-            :, :, :n_model
-        ]
+        src2 = F.multi_head_attention_forward(
+            q, k, v,
+            embed_dim_to_check=q.shape[-1],
+            num_heads=self.self_attn_nhead,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([
+                self.self_attn_q_proj.bias,
+                self.self_attn_k_proj.bias,
+                self.self_attn_v_proj.bias,
+            ]),
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=self.self_attn_dropout if self.training else 0.0,
+            out_proj_weight=self.self_attn_out_proj.weight,
+            out_proj_bias=self.self_attn_out_proj.bias,
+            training=self.training,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+            attn_mask=src_mask,
+            use_separate_proj_weight=True,
+            q_proj_weight=self.self_attn_q_proj.weight,
+            k_proj_weight=self.self_attn_k_proj.weight,
+            v_proj_weight=self.self_attn_v_proj.weight,
+        )[0][:, :, :n_model]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -179,7 +207,31 @@ class ConditionalTransformerEncoderLayer(nn.Module):
     ):
         src2 = self.norm1(src)
         q = k = self.with_pos_embed(src2, pos)
-        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+        src2 = F.multi_head_attention_forward(
+            q, k, src2,
+            embed_dim_to_check=q.shape[-1],
+            num_heads=self.self_attn_nhead,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([
+                self.self_attn_q_proj.bias,
+                self.self_attn_k_proj.bias,
+                self.self_attn_v_proj.bias,
+            ]),
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=self.self_attn_dropout if self.training else 0.0,
+            out_proj_weight=self.self_attn_out_proj.weight,
+            out_proj_bias=self.self_attn_out_proj.bias,
+            training=self.training,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+            attn_mask=src_mask,
+            use_separate_proj_weight=True,
+            q_proj_weight=self.self_attn_q_proj.weight,
+            k_proj_weight=self.self_attn_k_proj.weight,
+            v_proj_weight=self.self_attn_v_proj.weight,
+        )[0]
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))

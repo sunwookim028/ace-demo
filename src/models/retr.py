@@ -233,9 +233,9 @@ class RETR(nn.Module):
                 pred_masks = self.paste_masks_in_image(pred_masks, boxes, (self.ih, self.iw))
 
                 h, w = pred_masks.shape[-2:]
-                final_mask = torch.zeros(h, w, device=pred_masks.device)
-                final_masks = torch.zeros(len(pred_masks), h, w, device=pred_masks.device)
-                final_logits = torch.zeros(h, w, device=pred_masks.device)
+                final_mask = torch.zeros(h, w, device=pred_masks.device, dtype=pred_masks.dtype)
+                final_masks = torch.zeros(len(pred_masks), h, w, device=pred_masks.device, dtype=pred_masks.dtype)
+                final_logits = torch.zeros(h, w, device=pred_masks.device, dtype=pred_masks.dtype)
 
                 for q, current_mask in enumerate(pred_masks.detach()):
                     mask_thresh = current_mask[0] > self.thresh_mask
