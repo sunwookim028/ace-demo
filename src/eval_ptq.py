@@ -98,6 +98,11 @@ def get_args_parser():
                         choices=[8],
                         help="If set, also fake-quantize decoder attention "
                              "activations (Q/K/V) to this many bits.")
+    parser.add_argument("--use_autocast", action="store_true",
+                        help="Wrap forward pass in torch.autocast(bfloat16). "
+                             "Stacks on top of any --scheme: linears stay INT8 "
+                             "(int8dq dispatch bypasses autocast), backbone Conv2d "
+                             "and attention bmm run BF16.")
 
     # --- output ---
     parser.add_argument("--run_name", default=None, type=str,
@@ -109,7 +114,8 @@ def get_args_parser():
 def build_run_name(args) -> str:
     scheme_tag = args.scheme if args.scheme else "fp32"
     attn_tag = f"_attn{args.attn_act_bits}" if args.attn_act_bits else ""
-    return f"{args.split}_{scheme_tag}_{args.component}{attn_tag}"
+    autocast_tag = "_bf16" if getattr(args, "use_autocast", False) else ""
+    return f"{args.split}_{scheme_tag}_{args.component}{attn_tag}{autocast_tag}"
 
 
 def main(args):
@@ -152,7 +158,7 @@ def main(args):
     metrics = Metrics(seg=(task_internal == "SEG")).to(device)
 
     latencies = []
-    use_autocast = args.scheme in DTYPE_SCHEMES
+    use_autocast = args.scheme in DTYPE_SCHEMES or getattr(args, "use_autocast", False)
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=torch.bfloat16)
         if use_autocast else torch.autocast(device_type=device.type, enabled=False)
@@ -187,6 +193,7 @@ def main(args):
         "scheme": args.scheme if args.scheme else "fp32",
         "component": args.component,
         "attn_act_bits": args.attn_act_bits,
+        "use_autocast": getattr(args, "use_autocast", False),
         "pretrained_path": args.pretrained_path,
         # accuracy
         "bbox_ap": res["det_img"]["map"].item(),

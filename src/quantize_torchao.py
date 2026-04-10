@@ -75,13 +75,17 @@ from models.module_retr.attention import MultiheadAttention as CustomMHA
 SCHEMES = {
     "bf16": "bf16",  # sentinel — handled as dtype conversion, not torchao
     "int8wo": Int8WeightOnlyConfig(),
-    "int4wo_g128": Int4WeightOnlyConfig(group_size=128),
-    "int4wo_g64": Int4WeightOnlyConfig(group_size=64),
-    "int4wo_g32": Int4WeightOnlyConfig(group_size=32),
     "int8dq": Int8DynamicActivationInt8WeightConfig(),
+    # INT4 weight-only: symmetric per-group fake-quant (weights rounded to INT4,
+    # dequantized back to FP32 before matmul).  Correctly models accuracy impact
+    # of INT4 weight quantization without requiring mslk/tinygemm kernels.
+    "int4fq_g128": 128,
+    "int4fq_g64": 64,
+    "int4fq_g32": 32,
 }
 
 DTYPE_SCHEMES = {"bf16"}  # schemes that use dtype conversion instead of torchao
+INT4_FQ_SCHEMES = {"int4fq_g128", "int4fq_g64", "int4fq_g32"}  # fake-quant INT4
 
 # ---------------------------------------------------------------------------
 # Component filter functions
@@ -210,6 +214,51 @@ def migrate_encoder_mha_state_dict(state_dict: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# INT4 fake-quant (weight-only, per-group symmetric)
+# ---------------------------------------------------------------------------
+
+def _apply_int4_weight_fake_quant(
+    model: nn.Module,
+    group_size: int,
+    filter_fn,
+) -> None:
+    """
+    Apply symmetric per-group INT4 fake-quantization to matched nn.Linear weights.
+
+    For each weight matrix W [out, in]:
+      1. Partition input dim into groups of `group_size`.
+      2. Compute per-group scale = max(|W_group|) / 7  (INT4 symmetric range [-8, 7]).
+      3. Quantize: W_q = clamp(round(W / scale), -8, 7).
+      4. Dequantize: W_dq = W_q * scale.
+      5. Replace mod.weight.data with W_dq (FP32, same shape).
+
+    Runtime matmul remains FP32 (weight-only quantization).  The rounding noise
+    introduced here is identical to what hardware INT4 weight-only would produce,
+    so accuracy results are directly comparable to hardware deployment.
+
+    Stores metadata in model._int4_fq_modules = {module_name: (out_f, in_f, g)}
+    for `model_size_mb` to compute theoretical INT4 storage size.
+    """
+    fq_meta = {}
+    for name, mod in model.named_modules():
+        if not (isinstance(mod, nn.Linear) and filter_fn(mod, name)):
+            continue
+        w = mod.weight.data  # [out_features, in_features]
+        out_f, in_f = w.shape
+        if in_f % group_size != 0:
+            # Skip layers not divisible by group_size (rare; small bias layers).
+            continue
+        n_groups = in_f // group_size
+        w_g = w.reshape(out_f, n_groups, group_size)  # [out, n_groups, g]
+        # Per-group symmetric scale: maps max absolute weight to INT4 max (7).
+        scale = w_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 7.0
+        w_q = (w_g / scale).round().clamp(-8, 7)
+        mod.weight.data = (w_q * scale).reshape(out_f, in_f)
+        fq_meta[name] = (out_f, in_f, group_size)
+    model._int4_fq_modules = fq_meta
+
+
+# ---------------------------------------------------------------------------
 # Main PTQ entry point
 # ---------------------------------------------------------------------------
 
@@ -235,6 +284,8 @@ def apply_ptq(model: nn.Module, scheme: str, component: str) -> nn.Module:
     if component not in COMPONENT_FILTERS:
         raise ValueError(f"Unknown component '{component}'. Choose from: {list(COMPONENT_FILTERS)}")
 
+    filter_fn = COMPONENT_FILTERS[component]
+
     # BF16: use torch.autocast rather than model.to(bfloat16).
     # transformer.py has hardcoded dtype=torch.float32 in positional encodings;
     # model.to(bfloat16) causes dtype mismatches at those boundaries.
@@ -250,8 +301,13 @@ def apply_ptq(model: nn.Module, scheme: str, component: str) -> nn.Module:
             )
         return model  # no model mutation; autocast is applied in eval_ptq.py
 
+    # INT4 fake-quant: symmetric per-group weight rounding, FP32 matmul.
+    if scheme in INT4_FQ_SCHEMES:
+        group_size = SCHEMES[scheme]  # int: 128, 64, or 32
+        _apply_int4_weight_fake_quant(model, group_size, filter_fn)
+        return model
+
     quant_config = SCHEMES[scheme]
-    filter_fn = COMPONENT_FILTERS[component]
     quantize_(model, quant_config, filter_fn=filter_fn)
     return model
 
@@ -331,22 +387,59 @@ def register_attention_act_quant_hooks(
 def model_size_mb(model: nn.Module) -> float:
     """Total parameter + buffer memory in MB (approximate).
 
-    Handles torchao AffineQuantizedTensor weights by summing their actual
-    int_data + scale storage rather than the logical float32 size.
+    Handles three cases:
+    - torchao AffineQuantizedTensor: sums actual int_data + scale storage.
+    - INT4 fake-quant (model._int4_fq_modules set): computes theoretical INT4
+      packed storage (4 bits/weight) + FP32 scales, matching hardware layout.
+    - All other parameters: actual element count × element size.
     """
     try:
         from torchao.dtypes import AffineQuantizedTensor
     except ImportError:
         AffineQuantizedTensor = None
 
+    try:
+        from torchao.quantization.linear_activation_quantized_tensor import (
+            LinearActivationQuantizedTensor,
+        )
+    except ImportError:
+        LinearActivationQuantizedTensor = None
+
+    int4_fq_mods = getattr(model, "_int4_fq_modules", {})
+
+    def _aqt_storage(p):
+        """Bytes for an AffineQuantizedTensor: int_data + scale."""
+        impl = p.tensor_impl
+        return (
+            impl.int_data.nelement() * impl.int_data.element_size()
+            + impl.scale.nelement() * impl.scale.element_size()
+        )
+
     total = 0
-    for p in model.parameters():
-        if AffineQuantizedTensor is not None and isinstance(p, AffineQuantizedTensor):
-            impl = p.tensor_impl
-            total += impl.int_data.nelement() * impl.int_data.element_size()
-            total += impl.scale.nelement() * impl.scale.element_size()
+    for param_name, p in model.named_parameters():
+        parts = param_name.rsplit(".", 1)
+        mod_name = parts[0] if len(parts) == 2 else ""
+        param_base = parts[1] if len(parts) == 2 else parts[0]
+
+        if mod_name in int4_fq_mods and param_base == "weight":
+            out_f, in_f, g = int4_fq_mods[mod_name]
+            # INT4 packed: 2 weights per byte
+            total += (out_f * in_f + 1) // 2
+            # FP32 scale per group per output channel
+            total += out_f * (in_f // g) * 4
+        elif AffineQuantizedTensor is not None and isinstance(p, AffineQuantizedTensor):
+            total += _aqt_storage(p)
+        elif (
+            LinearActivationQuantizedTensor is not None
+            and isinstance(p, LinearActivationQuantizedTensor)
+            and AffineQuantizedTensor is not None
+            and isinstance(p.original_weight_tensor, AffineQuantizedTensor)
+        ):
+            # int8dq: activation quantization wrapper around an AQT weight
+            total += _aqt_storage(p.original_weight_tensor)
         else:
             total += p.nelement() * p.element_size()
+
     for b in model.buffers():
         total += b.nelement() * b.element_size()
     return total / (1024 ** 2)

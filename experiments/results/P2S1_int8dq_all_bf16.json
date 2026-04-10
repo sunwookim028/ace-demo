@@ -1,0 +1,21 @@
+{
+  "run_name": "P2S1_int8dq_all_bf16",
+  "split": "P2S1",
+  "task": "DETSEG",
+  "scheme": "int8dq",
+  "component": "all",
+  "attn_act_bits": null,
+  "use_autocast": true,
+  "pretrained_path": "../logs/pretrained_model/p2s1_retr_detseg.pth",
+  "bbox_ap": 0.41065576672554016,
+  "bbox_ap50": 0.7711110711097717,
+  "bbox_ap75": 0.39314743876457214,
+  "bbox_ar1": 0.38454246520996094,
+  "bbox_ar10": 0.5188974142074585,
+  "seg_iou": 0.7422370910644531,
+  "model_size_fp32_mb": 156.13,
+  "model_size_quant_mb": 81.39,
+  "latency_mean_s": 0.11425,
+  "latency_std_s": 0.00707,
+  "n_batches": 2885
+}

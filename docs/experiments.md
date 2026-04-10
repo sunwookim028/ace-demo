@@ -28,15 +28,17 @@ No model weights are modified during training (PTQ only). No QAT. The pretrained
 |-----------|--------|------------------------|
 | *(omit)* | FP32 baseline | Nothing — full float32 |
 | `bf16` | `torch.autocast(bfloat16)` | Eligible ops cast to bf16 on-the-fly; weights stay float32 |
-| `int8wo` | INT8 weight-only | Weights stored int8; **dequantized to float32 before matmul**; activations and math fully float32 |
-| `int4wo_g128` | INT4 weight-only, group=128 | Weights stored int4 per 128-element group; dequantized to float32 before matmul |
-| `int4wo_g64` | INT4 weight-only, group=64 | Finer grouping → higher precision, larger overhead |
-| `int4wo_g32` | INT4 weight-only, group=32 | Finest grouping in sweep |
-| `int8dq` | INT8 dynamic weight+activation | Weights int8 (per-channel); activations quantized per-token at runtime **before** matmul; actual INT8 arithmetic |
+| `int8wo` | INT8 weight-only (torchao) | Weights stored int8; **dequantized to float32 before matmul**; activations and math fully float32 |
+| `int4fq_g128` | INT4 weight-only, group=128 | Symmetric per-group INT4 fake-quant: weights rounded to INT4 precision, dequantized to float32 before matmul |
+| `int4fq_g64` | INT4 weight-only, group=64 | Finer grouping → lower rounding error, larger scale overhead |
+| `int4fq_g32` | INT4 weight-only, group=32 | Finest grouping in sweep |
+| `int8dq` | INT8 dynamic weight+activation (torchao) | Weights int8 (per-channel); activations quantized per-token at runtime **before** matmul; actual INT8 arithmetic |
 
-**Key point for int8wo / int4wo:** Computation is still float32. The only hardware benefit is reduced memory bandwidth (smaller weight tensors fetched from DRAM). Latency improvement depends on memory-bandwidth-bound vs compute-bound regime.
+**Key point for int8wo / int4fq:** Computation is still float32. The hardware benefit is reduced memory bandwidth (smaller weight tensors fetched from DRAM). INT4 fake-quant uses symmetric per-group quantization: scale = max(|W_group|) / 7, rounded to [-8, 7], dequantized back to float32 — identical rounding noise to hardware INT4 weight-only.
 
 **Key point for int8dq:** Both weights and activations are quantized. This targets compute-bound paths and enables actual INT8 GEMM on supported hardware (CUDA, CPU with AVX-VNNI). It is the most aggressive scheme and most likely to impact accuracy.
+
+> **Note on INT4 implementation:** torchao 0.17.0's `Int4WeightOnlyConfig` requires the `mslk` library (not publicly available) for CPU execution. INT4 is implemented directly as per-group symmetric fake-quant in `quantize_torchao._apply_int4_weight_fake_quant`. The accuracy measurement is identical to hardware INT4 weight-only — same rounding noise, same dequant-to-FP32 compute path.
 
 ---
 
@@ -98,11 +100,11 @@ bash experiments/run_sweep_quick.sh [--dry-run]
 | Baseline | *(none)* | — | 1 |
 | BF16 | `bf16` | `all` | 1 |
 | INT8 weight-only per-component | `int8wo` | backbone, encoder, decoder, transformer, ffn, proj, all | 7 |
-| INT4 group size sweep | `int4wo_g{128,64,32}` | `all` | 3 |
-| INT4 per-component | `int4wo_g128` | backbone, encoder, decoder, transformer, ffn, proj | 6 |
+| INT4 group size sweep | `int4fq_g{128,64,32}` | `all` | 3 |
+| INT4 per-component | `int4fq_g128` | backbone, encoder, decoder, transformer, ffn, proj | 6 |
 | INT8 dynamic act+weight | `int8dq` | encoder, decoder, transformer, all | 4 |
 | INT8 weight + INT8 attn act | `int8wo` | decoder, all | 2 (with `--attn_act_bits 8`) |
-| INT4 + INT8 attn act | `int4wo_g128` | `all` | 1 (with `--attn_act_bits 8`) |
+| INT4 + INT8 attn act | `int4fq_g128` | `all` | 1 (with `--attn_act_bits 8`) |
 
 ```bash
 bash experiments/run_sweep.sh [--dry-run]

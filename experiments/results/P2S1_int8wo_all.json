@@ -1,0 +1,20 @@
+{
+  "run_name": "P2S1_int8wo_all",
+  "split": "P2S1",
+  "task": "DETSEG",
+  "scheme": "int8wo",
+  "component": "all",
+  "attn_act_bits": null,
+  "pretrained_path": "../logs/pretrained_model/p2s1_retr_detseg.pth",
+  "bbox_ap": 0.42734241485595703,
+  "bbox_ap50": 0.7793042063713074,
+  "bbox_ap75": 0.4205971658229828,
+  "bbox_ar1": 0.3972987234592438,
+  "bbox_ar10": 0.5389927625656128,
+  "seg_iou": 0.744051456451416,
+  "model_size_fp32_mb": 156.13,
+  "model_size_quant_mb": 81.39,
+  "latency_mean_s": 0.20254,
+  "latency_std_s": 0.24899,
+  "n_batches": 2885
+}

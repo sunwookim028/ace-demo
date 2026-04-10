@@ -1,0 +1,20 @@
+{
+  "run_name": "P2S1_int8wo_decoder",
+  "split": "P2S1",
+  "task": "DETSEG",
+  "scheme": "int8wo",
+  "component": "decoder",
+  "attn_act_bits": null,
+  "pretrained_path": "../logs/pretrained_model/p2s1_retr_detseg.pth",
+  "bbox_ap": 0.42727261781692505,
+  "bbox_ap50": 0.7794299125671387,
+  "bbox_ap75": 0.4205406606197357,
+  "bbox_ar1": 0.3972201943397522,
+  "bbox_ar10": 0.5389898419380188,
+  "seg_iou": 0.7440851330757141,
+  "model_size_fp32_mb": 156.13,
+  "model_size_quant_mb": 124.0,
+  "latency_mean_s": 0.14819,
+  "latency_std_s": 0.01088,
+  "n_batches": 2885
+}

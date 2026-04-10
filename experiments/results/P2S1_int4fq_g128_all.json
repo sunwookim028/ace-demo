@@ -1,0 +1,20 @@
+{
+  "run_name": "P2S1_int4fq_g128_all",
+  "split": "P2S1",
+  "task": "DETSEG",
+  "scheme": "int4fq_g128",
+  "component": "all",
+  "attn_act_bits": null,
+  "pretrained_path": "/home/sk3463/ace-demo/logs/pretrained_model/p2s1_retr_detseg.pth",
+  "bbox_ap": 0.4292505085468292,
+  "bbox_ap50": 0.7716121673583984,
+  "bbox_ap75": 0.4204477369785309,
+  "bbox_ar1": 0.39704573154449463,
+  "bbox_ar10": 0.540161669254303,
+  "seg_iou": 0.7432908415794373,
+  "model_size_fp32_mb": 156.13,
+  "model_size_quant_mb": 69.41,
+  "latency_mean_s": 0.1925,
+  "latency_std_s": 0.04385,
+  "n_batches": 2885
+}

@@ -242,7 +242,7 @@ class RETR(nn.Module):
                     final_masks[q][mask_thresh] = 1
                     final_mask[mask_thresh] = 1
                     positive = current_mask[0] > 0
-                    final_logits[positive] = current_mask[0][positive]
+                    final_logits[positive] = current_mask[0][positive].to(final_logits.dtype)
 
                 predictions.append(final_mask)
                 final_mask_logits.append(final_logits)
