@@ -253,12 +253,18 @@ FP32 baseline: **AP=42.78 / AR1=39.79 / Seg IoU=74.41 / 156.1 MB**
 | int4fq_g128 | all | 42.93 | +0.15 | 74.33 | 69.4 MB | 2.25× |
 | int4fq_g64 | all | 42.24 | −0.54 | 74.10 | 70.2 MB | 2.22× |
 | int4fq_g32 | all | 41.72 | −1.06 | 74.33 | 71.8 MB | 2.18× |
-| fp32 + attn-bmm INT8† | — | *(pending)* | — | — | 156.1 MB | — |
-| int8wo + attn-bmm INT8† | all | *(pending)* | — | — | 81.4 MB | 1.92× |
-| int8dq + attn-bmm INT8† | all | *(pending)* | — | — | 81.4 MB | 1.92× |
-| int4fq_g128 + attn-bmm INT8† | all | *(pending)* | — | — | 69.4 MB | 2.25× |
+| fp32 + attn-bmm INT8† | — | 42.78 | +0.00 | 74.41 | 156.1 MB | — |
+| int8wo + attn-bmm INT8† | all | 42.73 | −0.05 | 74.41 | 81.4 MB | 1.92× |
+| int8dq + attn-bmm INT8† | all | 42.66 | −0.12 | 74.40 | 81.4 MB | 1.92× |
+| int4fq_g128 + attn-bmm INT8† | all | 42.92 | +0.14 | 74.33 | 69.4 MB | 2.25× |
+| fp32 + attn-weights UINT8‡ | — | 42.88 | +0.10 | 74.44 | 156.1 MB | — |
+| fp32 + full attn INT8†‡ | — | 42.88 | +0.10 | 74.43 | 156.1 MB | — |
+| int8wo + full attn INT8†‡ | all | 42.73 | −0.05 | 74.41 | 81.4 MB | 1.92× |
+| int8dq + full attn INT8†‡ | all | 42.66 | −0.12 | 74.40 | 81.4 MB | 1.92× |
 
-†attn-bmm INT8: symmetric per-tensor INT8 fake-quantization of Q, K, V tensors at the bmm input (post-projection, post-head-split) — covers both encoder [4, 512, 512] and decoder [4, 10, 512] attention matmuls. Implemented as a straight-through estimator (STE); measures accuracy impact without hardware INT8 matmul speed. See `HANDOFF_ATTN_QUANT.md` for implementation details.
+†attn-bmm INT8: symmetric per-tensor INT8 fake-quantization of Q, K, V tensors at the bmm input (post-projection, post-head-split) — covers both encoder [4, 512, 512] and decoder [4, 10, 512] attention matmuls. Implemented as a straight-through estimator (STE); measures accuracy impact without hardware INT8 matmul speed.
+
+‡attn-weights UINT8: asymmetric per-tensor UINT8 fake-quantization of the attention weight matrix (softmax output) before AV bmm. Softmax output ∈ [0, 1]; UINT8 uses scale = max(x)/255 to exploit the full unsigned range (vs. symmetric INT8 which wastes half). Full attn INT8 = †+‡ combined.
 
 > **Method citations:** STE fake-quant — PyTorch `torch.ao.quantization.FakeQuantize`; attention matmul quantization in transformers — FQ-ViT (Lin et al., ICCV 2021, arXiv:2111.13824); detection transformer W4A4 PTQ — Q-DETR (Xu et al., CVPR 2023, arXiv:2304.00253).
 
@@ -279,7 +285,9 @@ FP32 baseline: **AP=42.78 / AR1=39.79 / Seg IoU=74.41 / 156.1 MB**
 - INT8 weight-only is effectively lossless at 1.92× compression (−0.05 AP, IoU unchanged)
 - INT8 dynamic activation adds −0.07 AP on top of weight-only at the same compression
 - Stacking BF16 autocast on top of int8dq causes −1.71 AP — error from BF16 backbone compounding with INT8 activation quantization; not a viable configuration
-- Attention dot-product matmuls (QK^T, AV) remain FP32 in all schemes — torchao intercepts `nn.Linear` only; the decoder's custom attention uses `torch.bmm`
+- INT8 Q/K/V at bmm input adds zero incremental loss — fp32+bmm8 is identical to fp32 baseline (Δ0.00); the dominant source of loss is weight quantization, not attention matmuls
+- INT8 attention weight matrix (softmax output, UINT8) likewise adds zero incremental loss — full INT8 attention (Q/K/V + weights) costs the same as weight quantization alone
+- int8dq + full attn INT8 (W8A8 everywhere including attention): AP=42.66, Δ−0.12 — same as int8dq without attention quantization; attention quantization is free
 
 ### Acceptable regression — literature survey (April 2026)
 

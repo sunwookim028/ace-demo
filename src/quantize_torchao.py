@@ -67,6 +67,7 @@ except ImportError as e:
     ) from e
 
 from models.module_retr.attention import MultiheadAttention as CustomMHA
+from models.module_retr.transformer import ConditionalTransformerEncoderLayer
 
 # ---------------------------------------------------------------------------
 # Quantization schemes
@@ -338,6 +339,45 @@ def _make_fake_quant_int8(bits: int = 8):
     return fake_quant
 
 
+def _make_fake_quant_uint8():
+    """Asymmetric per-tensor UINT8 for non-negative tensors (e.g. softmax output).
+
+    softmax output ∈ [0, 1], always non-negative.  Symmetric INT8 wastes half
+    the range; this uses the full [0, 255] unsigned range instead.
+    scale = max(x) / 255.0, clamp to [0, 255], dequant back to float32.
+    """
+    def fake_quant(x: torch.Tensor) -> torch.Tensor:
+        scale = x.max() / 255.0
+        if scale == 0:
+            return x
+        x_q = torch.clamp(torch.round(x / scale), 0, 255)
+        return x_q * scale
+    return fake_quant
+
+
+def register_attention_weights_quant_hooks(model: nn.Module) -> list:
+    """
+    Fake-quantize the attention weight matrix (softmax output) before AV bmm.
+    Uses UINT8 asymmetric (softmax output ∈ [0,1], always non-negative).
+
+    Sets attn_weights_fake_quant attribute on each affected module; the local
+    multi_head_attention_forward in attention.py applies it after softmax/dropout
+    and before torch.bmm(attn_output_weights, v).
+
+    Returns list of _ModAttrHandle objects (same pattern as
+    register_attention_bmm_quant_hooks); call .remove() on each to reset to None.
+    """
+    fake_quant = _make_fake_quant_uint8()
+    handles = []
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)):
+            mod.attn_weights_fake_quant = fake_quant
+            handles.append(_ModAttrHandle(mod, "attn_weights_fake_quant", None))
+
+    return handles
+
+
 def register_attention_act_quant_hooks(
     model: nn.Module, bits: int = 8
 ) -> list:
@@ -376,6 +416,51 @@ def register_attention_act_quant_hooks(
 
             handle = mod.register_forward_pre_hook(make_hook(name))
             handles.append(handle)
+
+    return handles
+
+
+class _ModAttrHandle:
+    """Cleanup handle for attribute-based hooks (no PyTorch hook handle)."""
+    def __init__(self, mod, attr, default):
+        self._mod = mod
+        self._attr = attr
+        self._default = default
+
+    def remove(self):
+        setattr(self._mod, self._attr, self._default)
+
+
+def register_attention_bmm_quant_hooks(
+    model: nn.Module, bits: int = 8
+) -> list:
+    """
+    Fake-quantize Q, K, V at the bmm input (post-projection, post-head-split).
+    Covers both encoder (ConditionalTransformerEncoderLayer) and decoder (CustomMHA).
+
+    scale = max(|x|) / 127  (per-tensor symmetric INT8, STE)
+
+    Sets qkv_fake_quant attribute on each affected module; the local
+    multi_head_attention_forward in attention.py applies it just before torch.bmm.
+    The encoder's forward_post was refactored to use the local MHA so this
+    attribute is honoured there too.
+
+    Parameters
+    ----------
+    model : RETR model (eval mode, weights loaded).
+    bits  : quantization precision (8).
+
+    Returns
+    -------
+    List of handle objects with .remove() to reset qkv_fake_quant to None.
+    """
+    fake_quant = _make_fake_quant_int8(bits)
+    handles = []
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)):
+            mod.qkv_fake_quant = fake_quant
+            handles.append(_ModAttrHandle(mod, "qkv_fake_quant", None))
 
     return handles
 

@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .attention import MultiheadAttention
+from .attention import MultiheadAttention, multi_head_attention_forward as _local_mha_forward
 
 
 class MLP(nn.Module):
@@ -132,6 +132,14 @@ class ConditionalTransformerEncoderLayer(nn.Module):
         self.ca_kpos_proj = nn.Linear(d_model, d_model)
         self.ca_vpos_proj = nn.Linear(d_model, d_model)
 
+        # Optional fake-quant applied to Q/K/V at bmm input (post-projection, post-head-split).
+        # Set by register_attention_bmm_quant_hooks(); None = disabled.
+        self.qkv_fake_quant = None
+
+        # Optional fake-quant applied to softmax output before AV bmm.
+        # Set by register_attention_weights_quant_hooks(); None = disabled.
+        self.attn_weights_fake_quant = None
+
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
@@ -166,16 +174,17 @@ class ConditionalTransformerEncoderLayer(nn.Module):
     ):
         _, _, n_model = src.shape
         q, k, v = self.with_pos_concat(src, src, src, pos, pos, pos)
-        src2 = F.multi_head_attention_forward(
+        # Apply projections explicitly so torchao quantization on self_attn_*_proj
+        # is respected, and so qkv_fake_quant can be injected at the bmm input.
+        q = self.self_attn_q_proj(q)
+        k = self.self_attn_k_proj(k)
+        v = self.self_attn_v_proj(v)
+        src2 = _local_mha_forward(
             q, k, v,
             embed_dim_to_check=q.shape[-1],
             num_heads=self.self_attn_nhead,
             in_proj_weight=None,
-            in_proj_bias=torch.cat([
-                self.self_attn_q_proj.bias,
-                self.self_attn_k_proj.bias,
-                self.self_attn_v_proj.bias,
-            ]),
+            in_proj_bias=None,
             bias_k=None,
             bias_v=None,
             add_zero_attn=False,
@@ -186,10 +195,9 @@ class ConditionalTransformerEncoderLayer(nn.Module):
             key_padding_mask=src_key_padding_mask,
             need_weights=True,
             attn_mask=src_mask,
-            use_separate_proj_weight=True,
-            q_proj_weight=self.self_attn_q_proj.weight,
-            k_proj_weight=self.self_attn_k_proj.weight,
-            v_proj_weight=self.self_attn_v_proj.weight,
+            out_dim=q.shape[-1],
+            qkv_fake_quant=self.qkv_fake_quant,
+            attn_weights_fake_quant=self.attn_weights_fake_quant,
         )[0][:, :, :n_model]
         src = src + self.dropout1(src2)
         src = self.norm1(src)

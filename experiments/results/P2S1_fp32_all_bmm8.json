@@ -1,0 +1,23 @@
+{
+  "run_name": "P2S1_fp32_all_bmm8",
+  "split": "P2S1",
+  "task": "DETSEG",
+  "scheme": "fp32",
+  "component": "all",
+  "attn_act_bits": null,
+  "attn_bmm_bits": 8,
+  "attn_weights_bits": null,
+  "use_autocast": false,
+  "pretrained_path": "../logs/pretrained_model/p2s1_retr_detseg.pth",
+  "bbox_ap": 0.4278131425380707,
+  "bbox_ap50": 0.7793360352516174,
+  "bbox_ap75": 0.4208894968032837,
+  "bbox_ar1": 0.3977988362312317,
+  "bbox_ar10": 0.5397109985351562,
+  "seg_iou": 0.7440617084503174,
+  "model_size_fp32_mb": 156.13,
+  "model_size_quant_mb": 156.13,
+  "latency_mean_s": 0.13931,
+  "latency_std_s": 0.01322,
+  "n_batches": 2885
+}

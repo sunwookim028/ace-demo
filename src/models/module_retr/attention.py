@@ -116,6 +116,14 @@ class MultiheadAttention(Module):
 
         self.add_zero_attn = add_zero_attn
 
+        # Optional fake-quant applied to Q/K/V at bmm input (post-head-split).
+        # Set by register_attention_bmm_quant_hooks(); None = disabled.
+        self.qkv_fake_quant = None
+
+        # Optional fake-quant applied to softmax output before AV bmm.
+        # Set by register_attention_weights_quant_hooks(); None = disabled.
+        self.attn_weights_fake_quant = None
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -199,6 +207,8 @@ class MultiheadAttention(Module):
                 k_proj_weight=self.k_proj_weight,
                 v_proj_weight=self.v_proj_weight,
                 out_dim=self.vdim,
+                qkv_fake_quant=self.qkv_fake_quant,
+                attn_weights_fake_quant=self.attn_weights_fake_quant,
             )
         else:
             return multi_head_attention_forward(
@@ -220,6 +230,8 @@ class MultiheadAttention(Module):
                 need_weights=need_weights,
                 attn_mask=attn_mask,
                 out_dim=self.vdim,
+                qkv_fake_quant=self.qkv_fake_quant,
+                attn_weights_fake_quant=self.attn_weights_fake_quant,
             )
 
 
@@ -248,6 +260,8 @@ def multi_head_attention_forward(
     static_k: Optional[Tensor] = None,
     static_v: Optional[Tensor] = None,
     out_dim: Optional[Tensor] = None,
+    qkv_fake_quant=None,
+    attn_weights_fake_quant=None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     r"""
     Args:
@@ -445,6 +459,11 @@ def multi_head_attention_forward(
         if key_padding_mask is not None:
             key_padding_mask = pad(key_padding_mask, (0, 1))
 
+    if qkv_fake_quant is not None:
+        q = qkv_fake_quant(q)
+        k = qkv_fake_quant(k)
+        v = qkv_fake_quant(v)
+
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
@@ -464,6 +483,8 @@ def multi_head_attention_forward(
 
     attn_output_weights = softmax(attn_output_weights, dim=-1)
     attn_output_weights = dropout(attn_output_weights, p=dropout_p, training=training)
+    if attn_weights_fake_quant is not None:
+        attn_output_weights = attn_weights_fake_quant(attn_output_weights)
 
     attn_output = torch.bmm(attn_output_weights, v)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, v_head_dim]

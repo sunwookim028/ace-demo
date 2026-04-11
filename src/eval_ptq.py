@@ -60,6 +60,8 @@ from quantize_torchao import (
     migrate_encoder_mha_state_dict,
     model_size_mb,
     register_attention_act_quant_hooks,
+    register_attention_bmm_quant_hooks,
+    register_attention_weights_quant_hooks,
 )
 from utils.common import move_to_device
 from utils.detection_process import Metrics
@@ -98,6 +100,16 @@ def get_args_parser():
                         choices=[8],
                         help="If set, also fake-quantize decoder attention "
                              "activations (Q/K/V) to this many bits.")
+    parser.add_argument("--attn_bmm_bits", default=None, type=int,
+                        choices=[8],
+                        help="Fake-quantize Q/K/V at bmm input (post-projection, "
+                             "post-head-split) to INT{bits}. Covers encoder and "
+                             "decoder attention matmuls (QK^T and AV).")
+    parser.add_argument("--attn_weights_bits", default=None, type=int,
+                        choices=[8],
+                        help="Fake-quantize attention weight matrix (softmax output) "
+                             "to UINT8 before AV bmm. Non-negative ∈ [0,1]; uses "
+                             "asymmetric unsigned quantization.")
     parser.add_argument("--use_autocast", action="store_true",
                         help="Wrap forward pass in torch.autocast(bfloat16). "
                              "Stacks on top of any --scheme: linears stay INT8 "
@@ -114,8 +126,10 @@ def get_args_parser():
 def build_run_name(args) -> str:
     scheme_tag = args.scheme if args.scheme else "fp32"
     attn_tag = f"_attn{args.attn_act_bits}" if args.attn_act_bits else ""
+    bmm_tag = f"_bmm{args.attn_bmm_bits}" if getattr(args, "attn_bmm_bits", None) else ""
+    aw_tag = f"_aw{args.attn_weights_bits}" if getattr(args, "attn_weights_bits", None) else ""
     autocast_tag = "_bf16" if getattr(args, "use_autocast", False) else ""
-    return f"{args.split}_{scheme_tag}_{args.component}{attn_tag}{autocast_tag}"
+    return f"{args.split}_{scheme_tag}_{args.component}{attn_tag}{bmm_tag}{aw_tag}{autocast_tag}"
 
 
 def main(args):
@@ -140,6 +154,12 @@ def main(args):
 
     if args.attn_act_bits is not None:
         attn_hooks = register_attention_act_quant_hooks(model, bits=args.attn_act_bits)
+
+    if getattr(args, "attn_bmm_bits", None) is not None:
+        attn_hooks += register_attention_bmm_quant_hooks(model, bits=args.attn_bmm_bits)
+
+    if getattr(args, "attn_weights_bits", None) is not None:
+        attn_hooks += register_attention_weights_quant_hooks(model)
 
     quant_size = model_size_mb(model)
 
@@ -193,6 +213,8 @@ def main(args):
         "scheme": args.scheme if args.scheme else "fp32",
         "component": args.component,
         "attn_act_bits": args.attn_act_bits,
+        "attn_bmm_bits": getattr(args, "attn_bmm_bits", None),
+        "attn_weights_bits": getattr(args, "attn_weights_bits", None),
         "use_autocast": getattr(args, "use_autocast", False),
         "pretrained_path": args.pretrained_path,
         # accuracy
