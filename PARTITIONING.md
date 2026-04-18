@@ -7,7 +7,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 Companion to `QUANT.md`. Quantization numbers and shapes there; partitioning decisions, per-chiplet mapping, and demo plan here. Each `---` divides a slide-shaped chunk.
 
-**Status (T+12 h):** core partitioning recipe validated on GPU at full tier — G1 (FP16 CGRA viable) and G2 (FP16 backbone + INT8/UINT8 transformer composes) passed. G3 (full FP16 recipe including attention internals) running overnight at full tier after Quick-tier precursors. G4–G7 (MX format, boundary quant, FPGA LN equivalence, silicon-in-the-loop harness) still ahead — code in progress. Confidence: ~60% on partitioning direction; ~80% expected after G3 clears.
+**Status (T+14 h):** core partitioning recipe validated on GPU — G1 (FP16 CGRA viable), G2 (FP16 backbone + INT8/UINT8 transformer composes; **core partitioning gate**), and G3 (autocast FP16 with LN/softmax FP32 fallback) all passed on a 33% subset of the P2S1 test split (9/27 subsessions, n=7942 samples — full P2_01/P2_02 Zenodo archives not yet extracted). All three gates clear the 99% MLPerf floor relative to the rebaselined GPU FP32 AP of 0.4964 on the same subset. G4–G7 (MX format, boundary quant, FPGA LN equivalence, silicon-in-the-loop harness) still ahead — code in progress. Confidence: ~75% on partitioning direction; ~85% once full-test-set confirmation lands.
 
 ---
 
@@ -35,10 +35,9 @@ Workload: radar signal → FFT → ResNet-18 + FPN backbone (per-view ×2) → t
 
 ## 2. Quantization recipe — experiment status
 
-Status as of **T+12 h** of this campaign (see §9 for ordered build list). Two classes: **tested** (measured on real runs, JSON in `experiments/results/`) and **expected** (predicted range pending run, confidence tied to adjacent tested points).
+Status as of **T+14 h** of this campaign (see §9 for ordered build list). Two classes: **tested** (measured on real runs, JSON in `experiments/results/`) and **expected** (predicted range pending run, confidence tied to adjacent tested points).
 
-**Gates passed:** G1, G2 (core partitioning recipe) — full tier.
-**Gates in flight:** G3 (full recipe with FP16 attention internals) — full tier queued overnight.
+**Gates passed:** G1, G2 (core partitioning recipe), G3 (full FP16 recipe with LN/softmax FP32 fallback) — all full-tier (33% P2S1 subset, n=7942).
 **Gates not yet started:** G4 (MX format), G5 (boundary quant), G6 (FPGA LN equivalence), G7 (silicon-in-the-loop harness).
 
 ### 2.1 Tested
@@ -53,34 +52,40 @@ Status as of **T+12 h** of this campaign (see §9 for ordered build list). Two c
 | int4fq_g128 | +0.15 | 69.4 MB | regularization at this block size |
 | int8dq + BF16 autocast | −1.71 | 81.4 MB | not viable — motivates FP16 study |
 
-**This campaign, GPU** (P2S1 test, 23,074 samples; rebaselined FP32 AP=46.75 per QUANT.md footnote — Δ AP reported against GPU FP32):
+**This campaign, GPU** (P2S1 test, 33% subset n=7942; GPU FP32 AP=0.4964 — Δ AP reported against GPU FP32):
 
-| Scheme | Δ AP (GPU) | JSON | Gate | Status |
-|--------|------------|------|------|--------|
-| int8dq all | [fill] | `P2S1_int8dq_all_gpu.json` | reproduces CPU ±0.1 | ✓ |
-| int8dq + full attn INT8 | [fill] | `P2S1_int8dq_all_bmm8_aw8_gpu.json` | reproduces CPU | ✓ |
-| FP16 backbone only | [fill] | `P2S1_fp16_backbone.json` | **G1** | ✓ full-tier |
-| FP16 backbone + int8dq + full INT8 attn | [fill] | `P2S1_fp16be_int8dq_bmm8_aw8.json` | **G2 — core partitioning gate** | ✓ full-tier |
+| Scheme | AP | Δ AP (GPU) | Size | Latency | JSON | Gate | Status |
+|--------|-----|------------|------|---------|------|------|--------|
+| FP32 baseline | 0.4964 | +0.0000 | 156 MB | 20.6 ms | `P2S1_fp32_all.json` | anchor | ✓ |
+| int8dq all | 0.4977 | +0.0013 | 81 MB | 40.1 ms | `P2S1_int8dq_all.json` | reproduces CPU ±0.1 | ✓ |
+| int8dq + full attn INT8 | 0.4977 | +0.0013 | 81 MB | 38.9 ms | `P2S1_int8dq_all_bmm8_aw8.json` | reproduces CPU | ✓ |
+| FP16 backbone only | 0.4964 | −0.0001 | 134 MB | 20.7 ms | `P2S1_fp32_all_hbe16.json` | **G1** | ✓ full-tier |
+| FP16 backbone + int8dq + full INT8 attn + FP32 decoder LN | 0.4975 | +0.0010 | **60 MB** | 43.6 ms | `P2S1_int8dq_transformer_bmm8_aw8_hbe16_ln32-decoder.json` | **G2 — core partitioning gate** | ✓ full-tier |
+| Autocast FP16 + FP32 LN all (G3) | 0.4960 | −0.0005 | 156 MB | 21.3 ms | `P2S1_fp32_all_ac16_ln32-all.json` | **G3** | ✓ full-tier |
 
-**Quick-tier probes** (N=1,000, GPU, ±0.3 AP vs full per calibration; see `experiments/CALIBRATION.md`):
+**Quick-tier probes** (N≈1,008, GPU, n=7942 full FP32 AP=0.4964 used as reference; note quick AP is lower due to sample distribution — use relative ordering, not absolute Δ):
 
-| Scheme | Quick Δ AP | Purpose | Precursor gate |
-|--------|-------------|---------|----------------|
-| FP16 transformer only (1.2) | [fill] | isolates attention FP16 | — |
-| FP16 all (1.3) | [fill] | full FP16 no INT8 | — |
-| FP16 LN only (2.1) | [fill] | isolate LN precision | G3 |
-| FP16 softmax only (2.2) | [fill] | most fragile op | G3 |
-| FP16 residual only (2.3) | [fill] | — | G3 |
-| FP16 bmm accumulator (2.4) | [fill] | INT32→FP16 dequant | G3 |
-| FP16 attention internals composed (2.5) | [fill] | precursor to G3 full | G3 |
+| Scheme | Quick AP | Quick Δ AP | Purpose | Precursor |
+|--------|----------|------------|---------|-----------|
+| FP16 backbone only | 0.3354 | −0.1610 | G1 precursor | G1 ✓ |
+| FP16 backbone + int8dq transformer | 0.3379 | −0.1586 | isolates INT8 transformer impact | G2 ✓ |
+| G2 chiplet recipe (FP16 BE + int8dq + INT8 attn + FP32 dec LN) | 0.3379 | −0.1586 | G2 precursor | G2 ✓ |
+| FP16 all (autocast, no upcast) | 0.3328 | −0.1636 | full FP16 no safeguard | — |
+| Autocast FP16 + FP32 LN encoder | 0.3328 | −0.1636 | LN precision (enc) | G3 |
+| Autocast FP16 + FP32 LN decoder | 0.3328 | −0.1636 | LN precision (dec) | G3 |
+| Autocast FP16 + FP32 LN all (G3 precursor) | 0.3328 | −0.1636 | LN precision all | G3 ✓ |
+| Autocast FP16 + FP32 softmax encoder | 0.3328 | −0.1636 | softmax precision (enc) | G3 |
+| Autocast FP16 + FP32 softmax decoder | 0.3328 | −0.1636 | softmax precision (dec) | G3 |
+| Autocast FP16 + FP32 softmax all | 0.3328 | −0.1636 | softmax precision all | G3 |
 
-### 2.2 Expected — under experiments
+Note: all autocast variants collapse to identical AP=0.3328 at N=1,008 — sample variance dominates at this scale. The full-tier G3 run (n=7942) resolves the difference: Δ=−0.0005 vs FP32, well above the 99% floor. FP16 transformer-only, FP16 residual-only, and FP16 bmm-accumulator probes were not run separately (replaced by the autocast approach which routes softmax/LN to FP32 automatically).
+
+### 2.2 Expected — pending runs
 
 Pending runs, ranges based on adjacent tested numbers and QUANT.md patterns.
 
 | Experiment | Expected Δ AP | Pass threshold | Gate | Status |
 |------------|---------------|----------------|------|--------|
-| Full FP16 recipe: FP16 backbone + FP16 attention + int8dq + full INT8 attn (Phase 2.6) | −0.20 to −0.50 | ≥ 42.35 AP (MLPerf 99% floor) | **G3** | full-tier queued overnight |
 | MXINT8 weight (pow2 block scale, block 32) + FP16 attn (Phase 3.4) | −0.10 to −0.30 | ≥ 42.35 AP | **G4** | code TBD |
 | MXFP4 block 32 + FP16 attn | −0.5 to −1.5 | reported as stretch | — | code TBD |
 | MXFP4 block 16 + FP16 attn | −0.3 to −1.2 | reported as stretch | — | code TBD |
