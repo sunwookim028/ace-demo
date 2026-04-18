@@ -56,12 +56,20 @@ from quantize_torchao import (
     COMPONENT_FILTERS,
     DTYPE_SCHEMES,
     SCHEMES,
+    apply_fp16_half_backbone,
     apply_ptq,
     migrate_encoder_mha_state_dict,
     model_size_mb,
     register_attention_act_quant_hooks,
+    register_attention_bmm_fp4_hooks,
     register_attention_bmm_quant_hooks,
+    register_attention_weights_fp4_hooks,
     register_attention_weights_quant_hooks,
+    register_fp16_linear_out_hooks,
+    register_fp16_ln_hooks,
+    register_fp16_softmax_hooks,
+    register_fp32_ln_hooks,
+    register_fp32_softmax_hooks,
 )
 from utils.common import move_to_device
 from utils.detection_process import Metrics
@@ -110,11 +118,54 @@ def get_args_parser():
                         help="Fake-quantize attention weight matrix (softmax output) "
                              "to UINT8 before AV bmm. Non-negative ∈ [0,1]; uses "
                              "asymmetric unsigned quantization.")
+    parser.add_argument("--attn_bmm_fp4", action="store_true",
+                        help="NVFP4 E2M1 block fake-quant on Q/K/V at bmm input "
+                             "(block size 16, per-block FP8 scale). Mutually exclusive "
+                             "with --attn_bmm_bits.")
+    parser.add_argument("--attn_weights_fp4", action="store_true",
+                        help="NVFP4 E2M1 block fake-quant on attention weights "
+                             "(post-softmax, before AV bmm). Mutually exclusive with "
+                             "--attn_weights_bits.")
+    parser.add_argument("--attn_fp4_mx", action="store_true",
+                        help="Use power-of-2 (MX microscaling) scale for FP4 blocks "
+                             "instead of FP8 scale. ~3x cheaper scale compute. "
+                             "Requires --attn_bmm_fp4 or --attn_weights_fp4.")
     parser.add_argument("--use_autocast", action="store_true",
                         help="Wrap forward pass in torch.autocast(bfloat16). "
                              "Stacks on top of any --scheme: linears stay INT8 "
                              "(int8dq dispatch bypasses autocast), backbone Conv2d "
                              "and attention bmm run BF16.")
+    parser.add_argument("--use_autocast_fp16", action="store_true",
+                        help="Wrap forward in torch.autocast(float16). "
+                             "For GPU FP16 study; softmax/LN auto-upcast to FP32 "
+                             "by default (torch autocast op lists).")
+    parser.add_argument("--fp16_half_backbone", action="store_true",
+                        help="Convert RETR backbone + input_proj{,_ver} weights to "
+                             "FP16 (.half()). Casts inputs at backbone entry and "
+                             "outputs back to FP32 at input_proj. Skips AQT modules.")
+    parser.add_argument("--fp32_ln", default="none",
+                        choices=["none", "encoder", "decoder", "transformer", "all"],
+                        help="Force in-scope nn.LayerNorm to run FP32 regardless of "
+                             "surrounding autocast (chiplet LN-on-FPGA recipe).")
+    parser.add_argument("--fp32_softmax", default="none",
+                        choices=["none", "encoder", "decoder", "transformer", "all"],
+                        help="Force softmax to run FP32 in in-scope attention "
+                             "modules via attribute injection.")
+    parser.add_argument("--fp16_linear_out", default="none",
+                        choices=["none", "encoder", "decoder", "transformer", "all"],
+                        help="Cast nn.Linear output FP32→FP16 after each forward pass in scope. "
+                             "Fixes the torchao int8dq FP32 output so residual adds run in FP16.")
+    parser.add_argument("--fp16_ln", default="none",
+                        choices=["none", "encoder", "decoder", "transformer", "all"],
+                        help="Force in-scope nn.LayerNorm to run FP16 (casts params "
+                             "and input). Overrides --fp32_ln for the same scope.")
+    parser.add_argument("--fp16_softmax", default="none",
+                        choices=["none", "encoder", "decoder", "transformer", "all"],
+                        help="Force softmax to run FP16 in in-scope attention modules. "
+                             "Warning: FP16 softmax on encoder 512×512 maps may overflow.")
+    parser.add_argument("--max_samples", default=None, type=int,
+                        help="If set, stop evaluation after the first N samples "
+                             "(fast Quick runs). None = full test set.")
 
     # --- output ---
     parser.add_argument("--run_name", default=None, type=str,
@@ -128,8 +179,21 @@ def build_run_name(args) -> str:
     attn_tag = f"_attn{args.attn_act_bits}" if args.attn_act_bits else ""
     bmm_tag = f"_bmm{args.attn_bmm_bits}" if getattr(args, "attn_bmm_bits", None) else ""
     aw_tag = f"_aw{args.attn_weights_bits}" if getattr(args, "attn_weights_bits", None) else ""
+    mx_suffix = "mx" if getattr(args, "attn_fp4_mx", False) else ""
+    bmm_fp4_tag = f"_bmm{mx_suffix}fp4" if getattr(args, "attn_bmm_fp4", False) else ""
+    aw_fp4_tag = f"_aw{mx_suffix}fp4" if getattr(args, "attn_weights_fp4", False) else ""
     autocast_tag = "_bf16" if getattr(args, "use_autocast", False) else ""
-    return f"{args.split}_{scheme_tag}_{args.component}{attn_tag}{bmm_tag}{aw_tag}{autocast_tag}"
+    fp16_autocast_tag = "_ac16" if getattr(args, "use_autocast_fp16", False) else ""
+    fp16_be_tag = "_hbe16" if getattr(args, "fp16_half_backbone", False) else ""
+    ln_tag = f"_ln32-{args.fp32_ln}" if getattr(args, "fp32_ln", "none") != "none" else ""
+    sm_tag = f"_sm32-{args.fp32_softmax}" if getattr(args, "fp32_softmax", "none") != "none" else ""
+    lo16_tag = f"_lo16-{args.fp16_linear_out}" if getattr(args, "fp16_linear_out", "none") != "none" else ""
+    ln16_tag = f"_ln16-{args.fp16_ln}" if getattr(args, "fp16_ln", "none") != "none" else ""
+    sm16_tag = f"_sm16-{args.fp16_softmax}" if getattr(args, "fp16_softmax", "none") != "none" else ""
+    max_tag = f"_n{args.max_samples}" if getattr(args, "max_samples", None) else ""
+    return (f"{args.split}_{scheme_tag}_{args.component}{attn_tag}{bmm_tag}{aw_tag}"
+            f"{bmm_fp4_tag}{aw_fp4_tag}{autocast_tag}{fp16_autocast_tag}"
+            f"{fp16_be_tag}{ln_tag}{sm_tag}{lo16_tag}{ln16_tag}{sm16_tag}{max_tag}")
 
 
 def main(args):
@@ -161,6 +225,31 @@ def main(args):
     if getattr(args, "attn_weights_bits", None) is not None:
         attn_hooks += register_attention_weights_quant_hooks(model)
 
+    mx = getattr(args, "attn_fp4_mx", False)
+    if getattr(args, "attn_bmm_fp4", False):
+        attn_hooks += register_attention_bmm_fp4_hooks(model, block_size=16, mx_scale=mx)
+
+    if getattr(args, "attn_weights_fp4", False):
+        attn_hooks += register_attention_weights_fp4_hooks(model, block_size=16, mx_scale=mx)
+
+    if getattr(args, "fp16_half_backbone", False):
+        attn_hooks += apply_fp16_half_backbone(model)
+
+    if getattr(args, "fp32_ln", "none") != "none":
+        attn_hooks += register_fp32_ln_hooks(model, scope=args.fp32_ln)
+
+    if getattr(args, "fp32_softmax", "none") != "none":
+        attn_hooks += register_fp32_softmax_hooks(model, scope=args.fp32_softmax)
+
+    if getattr(args, "fp16_linear_out", "none") != "none":
+        attn_hooks += register_fp16_linear_out_hooks(model, scope=args.fp16_linear_out)
+
+    if getattr(args, "fp16_ln", "none") != "none":
+        attn_hooks += register_fp16_ln_hooks(model, scope=args.fp16_ln)
+
+    if getattr(args, "fp16_softmax", "none") != "none":
+        attn_hooks += register_fp16_softmax_hooks(model, scope=args.fp16_softmax)
+
     quant_size = model_size_mb(model)
 
     # ------------------------------------------------------------------- data
@@ -178,13 +267,17 @@ def main(args):
     metrics = Metrics(seg=(task_internal == "SEG")).to(device)
 
     latencies = []
-    use_autocast = args.scheme in DTYPE_SCHEMES or getattr(args, "use_autocast", False)
+    fp16_autocast = args.scheme == "fp16" or getattr(args, "use_autocast_fp16", False)
+    bf16_autocast = args.scheme == "bf16" or getattr(args, "use_autocast", False)
+    use_autocast = fp16_autocast or bf16_autocast
+    autocast_dtype = torch.float16 if fp16_autocast else torch.bfloat16
     autocast_ctx = (
-        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
         if use_autocast else torch.autocast(device_type=device.type, enabled=False)
     )
 
     model.eval()
+    n_samples_seen = 0
     with torch.no_grad():
         for batch in tqdm(test_loader, desc=build_run_name(args)):
             batch = move_to_device(batch, device)
@@ -201,6 +294,10 @@ def main(args):
 
             metrics.compute(labels, out)
 
+            n_samples_seen += rf_hor.shape[0]
+            if args.max_samples is not None and n_samples_seen >= args.max_samples:
+                break
+
     # get_result() prints and populates metrics.res but does NOT return.
     metrics.get_result()
 
@@ -215,7 +312,19 @@ def main(args):
         "attn_act_bits": args.attn_act_bits,
         "attn_bmm_bits": getattr(args, "attn_bmm_bits", None),
         "attn_weights_bits": getattr(args, "attn_weights_bits", None),
+        "attn_bmm_fp4": getattr(args, "attn_bmm_fp4", False),
+        "attn_weights_fp4": getattr(args, "attn_weights_fp4", False),
+        "attn_fp4_mx": getattr(args, "attn_fp4_mx", False),
         "use_autocast": getattr(args, "use_autocast", False),
+        "use_autocast_fp16": getattr(args, "use_autocast_fp16", False),
+        "fp16_half_backbone": getattr(args, "fp16_half_backbone", False),
+        "fp32_ln": getattr(args, "fp32_ln", "none"),
+        "fp32_softmax": getattr(args, "fp32_softmax", "none"),
+        "fp16_linear_out": getattr(args, "fp16_linear_out", "none"),
+        "fp16_ln": getattr(args, "fp16_ln", "none"),
+        "fp16_softmax": getattr(args, "fp16_softmax", "none"),
+        "max_samples": getattr(args, "max_samples", None),
+        "n_samples_seen": n_samples_seen,
         "pretrained_path": args.pretrained_path,
         # accuracy
         "bbox_ap": res["det_img"]["map"].item(),

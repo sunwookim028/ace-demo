@@ -279,6 +279,52 @@ FP32 baseline: **AP=42.78 / AR1=39.79 / Seg IoU=74.41 / 156.1 MB**
 
 ---
 
+## PTQ accuracy results — FP4 attention activations (P2S1, GPU)
+
+All runs: P2S1 test split, 7,942 samples. GPU: NVIDIA RTX 4070, batch 16. PyTorch 2.11, torchao 0.17.0.  
+GPU FP32 baseline: **AP=49.64 / Seg IoU=74.92 / 156.1 MB**  
+GPU int8dq_transformer baseline: **AP=49.77 / Seg IoU=74.96 / 81.4 MB** (Δ +0.13 vs GPU FP32 — oneDNN ordering)
+
+Scheme for all rows: `int8dq`, component: `transformer` (encoder + decoder linears W8A8).
+
+| Attn activation quant | Run tag | BBox AP | Δ AP vs int8dq | Seg IoU |
+|-----------------------|---------|---------|----------------|---------|
+| INT8 STE (baseline) | `_transformer` | 49.77 | — | 74.96 |
+| NVFP4 E2M1 Q/K/V only (FP8 scale) | `_bmmfp4` | 49.77 | 0.00 | 74.96 |
+| NVFP4 E2M1 Q/K/V + attn-weights (FP8 scale) | `_bmmfp4_awfp4` | 49.77 | 0.00 | 74.96 |
+| NVFP4 E2M1 Q/K/V + attn-weights (MX pow-2 scale) | `_bmmmxfp4_awmxfp4` | 49.77 | 0.00 | 74.96 |
+
+†FP4 block size 16 along last dim. FP8 scale = max(|block|)/6.0; MX scale = nearest power-of-2 above FP8 scale (~3× cheaper).  
+‡Decoder SA attn maps are 10×10 (100 elements = 7 full blocks + 1 partial block of 4, zero-padded). Small block count may increase FP4 error there but shows no measurable effect on AP.
+
+**Key finding:** NVFP4 E2M1 block quantization on all attention activations (Q, K, V, and post-softmax weights) adds **zero incremental AP loss** on top of int8dq W8A8 linears, for both FP8 and MX (power-of-2) scales. Attention coprocessor can safely use FP4 for all activation storage and transport.
+
+---
+
+## PTQ accuracy results — G2 + FP4 + all-FP16 precision ladder (P2S1, GPU)
+
+Each column adds one more FP16 push on top of the previous. All runs: int8dq transformer, FP16 backbone, FP4 attention activations.
+
+| Stage | baseline | +FP16 LN/SM/head | +FP16 residuals (FP8 scale) | +FP16 residuals (MX scale) |
+|-------|----------|------------------|-----------------------------|---------------------------|
+| Backbone | FP16 | FP16 | FP16 | FP16 |
+| W8A8 linear output | **FP32** | **FP32**† | **FP16** | **FP16** |
+| Residual adds | **FP32** | **FP32**† | **FP16** | **FP16** |
+| LayerNorm | **FP32** | FP16 | FP16 | FP16 |
+| Softmax | **FP32** | FP16 | FP16 | FP16 |
+| Detection/seg head | **FP32** | FP16 | FP16 | FP16 |
+| FP4 scale | FP8 | FP8 | FP8 | **MX pow-2** |
+| Tokenizer | **FP32** | FP16 | FP16 | FP16 |
+| **BBox AP** | **49.77** | **49.75** | **49.72** | **49.72** |
+| **Δ AP** | — | −0.02 | −0.05 | −0.05 |
+| **Seg IoU** | **74.96** | **75.04** | **75.02** | **75.02** |
+
+†torchao int8dq hardcodes INT32 accumulate → FP32 output; on real hardware the MAC array returns INT32 → rounds to FP16 directly.
+
+**Key finding:** Pushing LN, softmax, and heads to FP16 costs −0.02 AP. Pushing W8A8 linear outputs and residuals to FP16 costs an additional −0.03 AP (total −0.05). Switching from FP8 to MX (power-of-2) scale on FP4 blocks has **no further effect** — both land at AP=49.72. The entire precision ladder from FP32 through full-FP16+FP4-MX costs only **−0.05 AP total**, well within detection noise.
+
+---
+
 ## Acceptable regression — literature survey (April 2026)
 
 INT8 PTQ community norm for detection: **≤1 AP point** absolute. No prior RETR/MMVR quantization results exist; these are the first.

@@ -52,6 +52,7 @@ Design notes
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from torchao.quantization import (
@@ -75,6 +76,7 @@ from models.module_retr.transformer import ConditionalTransformerEncoderLayer
 
 SCHEMES = {
     "bf16": "bf16",  # sentinel — handled as dtype conversion, not torchao
+    "fp16": "fp16",  # sentinel — float16 autocast (primarily for GPU runs)
     "int8wo": Int8WeightOnlyConfig(),
     "int8dq": Int8DynamicActivationInt8WeightConfig(),
     # INT4 weight-only: symmetric per-group fake-quant (weights rounded to INT4,
@@ -85,7 +87,7 @@ SCHEMES = {
     "int4fq_g32": 32,
 }
 
-DTYPE_SCHEMES = {"bf16"}  # schemes that use dtype conversion instead of torchao
+DTYPE_SCHEMES = {"bf16", "fp16"}  # schemes that use dtype conversion instead of torchao
 INT4_FQ_SCHEMES = {"int4fq_g128", "int4fq_g64", "int4fq_g32"}  # fake-quant INT4
 
 # ---------------------------------------------------------------------------
@@ -355,6 +357,102 @@ def _make_fake_quant_uint8():
     return fake_quant
 
 
+# NVFP4 E2M1 representable positive values and their rounding boundaries.
+# E2M1: exponent bias=1, normal values ±{0.5,1,1.5,2,3,4,6}, plus zero.
+_FP4_POS_VALS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+_FP4_BOUNDARIES = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+
+
+def _make_fake_quant_nvfp4(block_size: int = 16, mx_scale: bool = False):
+    """NVFP4 E2M1 block-scaled fake-quant (straight-through estimator).
+
+    Matches the NVFP4 hardware quantizer: 128 activations/cycle, block size 16.
+
+    Per block of `block_size` consecutive elements along the last dimension:
+      max_abs = max(|x_block|)
+      scale   = max_abs / 6.0          # FP8 scale (full precision)
+      [mx_scale=True: round up to nearest power-of-2 — ~3x cheaper, MX format]
+      x_q     = round_fp4(x / scale) * scale
+
+    FP4 E2M1 representable values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+    """
+    pos_vals = _FP4_POS_VALS
+    boundaries = _FP4_BOUNDARIES
+
+    def fake_quant(x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        last = orig_shape[-1]
+
+        # Pad last dim to a multiple of block_size (keep padding out of scale calc)
+        if last % block_size != 0:
+            pad = block_size - last % block_size
+            x_work = F.pad(x, (0, pad))
+        else:
+            x_work = x
+
+        padded_last = x_work.shape[-1]
+        n_blocks = padded_last // block_size
+
+        # reshape to [..., n_blocks, block_size] — each block gets its own scale
+        blocked = x_work.reshape(*x_work.shape[:-1], n_blocks, block_size)
+
+        max_abs = blocked.abs().amax(dim=-1, keepdim=True)
+        if mx_scale:
+            # Round scale exponent up so max value never overflows FP4 range
+            scale = torch.pow(2.0, torch.ceil(torch.log2((max_abs / 6.0).clamp(min=1e-12))))
+        else:
+            scale = (max_abs / 6.0).clamp(min=1e-12)
+
+        x_scaled = blocked / scale  # values nominally in [-6, 6]
+
+        sign = x_scaled.sign()
+        abs_x = x_scaled.abs().clamp(max=6.0)
+        pv = pos_vals.to(x.device)
+        bv = boundaries.to(x.device)
+        idx = torch.bucketize(abs_x.contiguous(), bv)
+        x_dq = (sign * pv[idx] * scale).reshape(*orig_shape[:-1], padded_last)
+
+        if last % block_size != 0:
+            x_dq = x_dq[..., :last]
+        return x_dq
+
+    return fake_quant
+
+
+def register_attention_bmm_fp4_hooks(
+    model: nn.Module, block_size: int = 16, mx_scale: bool = False
+) -> list:
+    """Fake-quantize Q/K/V at bmm input using NVFP4 E2M1 block quantization.
+
+    Covers both encoder (ConditionalTransformerEncoderLayer) and decoder (CustomMHA).
+    Mutually exclusive with register_attention_bmm_quant_hooks — both write qkv_fake_quant.
+    """
+    fake_quant = _make_fake_quant_nvfp4(block_size=block_size, mx_scale=mx_scale)
+    handles = []
+    for _, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)):
+            mod.qkv_fake_quant = fake_quant
+            handles.append(_ModAttrHandle(mod, "qkv_fake_quant", None))
+    return handles
+
+
+def register_attention_weights_fp4_hooks(
+    model: nn.Module, block_size: int = 16, mx_scale: bool = False
+) -> list:
+    """Fake-quantize attention weights (post-softmax) using NVFP4 E2M1 block quantization.
+
+    Mutually exclusive with register_attention_weights_quant_hooks — both write
+    attn_weights_fake_quant.
+    """
+    fake_quant = _make_fake_quant_nvfp4(block_size=block_size, mx_scale=mx_scale)
+    handles = []
+    for _, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)):
+            mod.attn_weights_fake_quant = fake_quant
+            handles.append(_ModAttrHandle(mod, "attn_weights_fake_quant", None))
+    return handles
+
+
 def register_attention_weights_quant_hooks(model: nn.Module) -> list:
     """
     Fake-quantize the attention weight matrix (softmax output) before AV bmm.
@@ -429,6 +527,247 @@ class _ModAttrHandle:
 
     def remove(self):
         setattr(self._mod, self._attr, self._default)
+
+
+def apply_fp16_half_backbone(model: nn.Module) -> list:
+    """Convert the RETR backbone + input_proj{,_ver} Conv2d/BN weights to FP16.
+
+    Adds a forward pre-hook on backbone to cast input tensors to FP16, and a
+    forward post-hook on input_proj/input_proj_ver to cast output back to FP32
+    (so downstream transformer sees FP32).
+
+    Skips any module whose weight is an AffineQuantizedTensor (silent-corruption
+    guard: `.half()` on AQT is a no-op that leaves int8 weights but corrupts
+    downstream dtype chain).
+
+    Returns a list of handle objects with `.remove()` — currently empty because
+    dtype mutation is not easily reversible.
+    """
+    try:
+        from torchao.dtypes import AffineQuantizedTensor
+    except ImportError:
+        AffineQuantizedTensor = None
+
+    # RETR wraps: retr.model is the ConditionalDETR, which may be further wrapped
+    # by DETRsegm (retr.model.detr.*). Walk to the module that actually owns
+    # .backbone, .input_proj, .input_proj_ver.
+    inner = model
+    for attr in ("model", "detr"):
+        nxt = getattr(inner, attr, None)
+        if nxt is not None and hasattr(nxt, "backbone"):
+            inner = nxt
+            break
+        if nxt is not None:
+            inner = nxt
+    backbone = getattr(inner, "backbone", None)
+    if backbone is None:
+        raise ValueError("apply_fp16_half_backbone: could not locate .backbone attr")
+
+    def _has_aqt(m):
+        if AffineQuantizedTensor is None:
+            return False
+        for p in m.parameters(recurse=True):
+            if isinstance(p.data, AffineQuantizedTensor):
+                return True
+        return False
+
+    if _has_aqt(backbone):
+        raise RuntimeError("Backbone contains AQT (int8) weight; refusing .half()")
+    backbone.half()
+
+    def _cast_input_to_fp16(mod, args):
+        new = []
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                new.append(a.half())
+            elif hasattr(a, "tensors") and isinstance(a.tensors, torch.Tensor):
+                # NestedTensor: mutate in place — dataloader doesn't re-use.
+                a.tensors = a.tensors.half()
+                new.append(a)
+            else:
+                new.append(a)
+        return tuple(new)
+
+    handles = [backbone.register_forward_pre_hook(_cast_input_to_fp16)]
+
+    # Backbone returns (features, pos). features is a list of NestedTensors (FPN
+    # levels); the level-0 feature feeds input_proj, deeper levels feed mask_head
+    # and segmentation adapters directly. pos is a list of Tensors. Downstream
+    # ops outside backbone are fp32 (input_proj Conv2d, mask_head adapters,
+    # ca_kpos_proj Linear), so cast every output tensor back to fp32 at the
+    # backbone boundary to keep the fp16 scope strictly inside the backbone.
+    def _cast_fp16_to_fp32(x):
+        if isinstance(x, torch.Tensor) and x.dtype == torch.float16:
+            return x.float()
+        if hasattr(x, "tensors") and isinstance(x.tensors, torch.Tensor):
+            if x.tensors.dtype == torch.float16:
+                x.tensors = x.tensors.float()
+            return x
+        if isinstance(x, (list, tuple)):
+            return type(x)(_cast_fp16_to_fp32(xi) for xi in x)
+        return x
+
+    def _cast_backbone_out_to_fp32(mod, inp, out):
+        return _cast_fp16_to_fp32(out)
+    handles.append(backbone.register_forward_hook(_cast_backbone_out_to_fp32))
+
+    return handles
+
+
+def register_fp32_ln_hooks(model: nn.Module, scope: str = "all") -> list:
+    """Force nn.LayerNorm to run in FP32 regardless of surrounding autocast.
+
+    Pre-hook casts LN input to FP32; post-hook leaves output FP32 (downstream
+    autocast will recast on its own). Matches the PARTITIONING.md decoder LN
+    recipe where decoder LN must stay FP32 on the FPGA chiplet.
+
+    scope ∈ {"encoder", "decoder", "transformer", "all"}: which LN modules to target.
+    """
+    handles = []
+
+    def _in_scope(fqn: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "transformer":
+            return "encoder" in fqn or "decoder" in fqn
+        return scope in fqn
+
+    def _pre(mod, args):
+        if not args:
+            return args
+        x = args[0]
+        if isinstance(x, torch.Tensor) and x.dtype != torch.float32:
+            return (x.float(),) + tuple(args[1:])
+        return args
+
+    # Preserve LN param dtype as FP32 to match chiplet recipe; saves us from
+    # dtype mismatches if upstream halves LN weights.
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.LayerNorm) and _in_scope(name):
+            if mod.weight is not None and mod.weight.dtype != torch.float32:
+                mod.weight.data = mod.weight.data.float()
+            if mod.bias is not None and mod.bias.dtype != torch.float32:
+                mod.bias.data = mod.bias.data.float()
+            handles.append(mod.register_forward_pre_hook(_pre))
+
+    return handles
+
+
+def register_fp32_softmax_hooks(model: nn.Module, scope: str = "all") -> list:
+    """Set softmax_dtype=torch.float32 attribute on in-scope attention modules.
+
+    Read by multi_head_attention_forward in attention.py. Forces softmax compute
+    to FP32 (up-cast input, compute, down-cast output) even when surrounding
+    autocast is FP16/BF16.
+
+    scope ∈ {"encoder", "decoder", "transformer", "all"}.
+    """
+    handles = []
+
+    def _in_scope(fqn: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "transformer":
+            return "encoder" in fqn or "decoder" in fqn
+        return scope in fqn
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)) and _in_scope(name):
+            mod.softmax_dtype = torch.float32
+            handles.append(_ModAttrHandle(mod, "softmax_dtype", None))
+
+    return handles
+
+
+def register_fp16_linear_out_hooks(model: nn.Module, scope: str = "transformer") -> list:
+    """Cast nn.Linear output FP32→FP16 immediately after the forward pass.
+
+    torchao int8dq hardcodes INT32 accumulate → FP32 output. This post-hook
+    re-casts to FP16 so that residual adds after each W8A8 linear run in FP16
+    rather than upcasting to FP32.
+
+    scope ∈ {"encoder", "decoder", "transformer", "all"}.
+    """
+    handles = []
+
+    def _in_scope(fqn: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "transformer":
+            return "encoder" in fqn or "decoder" in fqn
+        return scope in fqn
+
+    def _post(mod, args, output):
+        if isinstance(output, torch.Tensor) and output.dtype != torch.float16:
+            return output.half()
+        return output
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and _in_scope(name):
+            handles.append(mod.register_forward_hook(_post))
+
+    return handles
+
+
+def register_fp16_ln_hooks(model: nn.Module, scope: str = "all") -> list:
+    """Force nn.LayerNorm to run in FP16.
+
+    Pre-hook casts input to FP16; LN params are cast to FP16. Output stays FP16
+    so downstream residual adds inherit the dtype. Opposite of register_fp32_ln_hooks.
+
+    scope ∈ {"encoder", "decoder", "transformer", "all"}.
+    """
+    handles = []
+
+    def _in_scope(fqn: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "transformer":
+            return "encoder" in fqn or "decoder" in fqn
+        return scope in fqn
+
+    def _pre(mod, args):
+        if not args:
+            return args
+        x = args[0]
+        if isinstance(x, torch.Tensor) and x.dtype != torch.float16:
+            return (x.half(),) + tuple(args[1:])
+        return args
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.LayerNorm) and _in_scope(name):
+            if mod.weight is not None:
+                mod.weight.data = mod.weight.data.half()
+            if mod.bias is not None:
+                mod.bias.data = mod.bias.data.half()
+            handles.append(mod.register_forward_pre_hook(_pre))
+
+    return handles
+
+
+def register_fp16_softmax_hooks(model: nn.Module, scope: str = "all") -> list:
+    """Set softmax_dtype=torch.float16 on in-scope attention modules.
+
+    Forces softmax to run in FP16 instead of the autocast default (FP32).
+    On encoder SA (512×512 maps) this risks overflow — use with awareness.
+
+    scope ∈ {"encoder", "decoder", "transformer", "all"}.
+    """
+    handles = []
+
+    def _in_scope(fqn: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "transformer":
+            return "encoder" in fqn or "decoder" in fqn
+        return scope in fqn
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, (CustomMHA, ConditionalTransformerEncoderLayer)) and _in_scope(name):
+            mod.softmax_dtype = torch.float16
+            handles.append(_ModAttrHandle(mod, "softmax_dtype", None))
+
+    return handles
 
 
 def register_attention_bmm_quant_hooks(

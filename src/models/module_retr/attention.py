@@ -124,6 +124,11 @@ class MultiheadAttention(Module):
         # Set by register_attention_weights_quant_hooks(); None = disabled.
         self.attn_weights_fake_quant = None
 
+        # Optional dtype override for the softmax compute (up-cast input,
+        # compute, down-cast output). Set by register_fp32_softmax_hooks();
+        # None = let autocast decide.
+        self.softmax_dtype = None
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -209,6 +214,7 @@ class MultiheadAttention(Module):
                 out_dim=self.vdim,
                 qkv_fake_quant=self.qkv_fake_quant,
                 attn_weights_fake_quant=self.attn_weights_fake_quant,
+                softmax_dtype=self.softmax_dtype,
             )
         else:
             return multi_head_attention_forward(
@@ -232,6 +238,7 @@ class MultiheadAttention(Module):
                 out_dim=self.vdim,
                 qkv_fake_quant=self.qkv_fake_quant,
                 attn_weights_fake_quant=self.attn_weights_fake_quant,
+                softmax_dtype=self.softmax_dtype,
             )
 
 
@@ -262,6 +269,7 @@ def multi_head_attention_forward(
     out_dim: Optional[Tensor] = None,
     qkv_fake_quant=None,
     attn_weights_fake_quant=None,
+    softmax_dtype=None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     r"""
     Args:
@@ -481,7 +489,12 @@ def multi_head_attention_forward(
         )
         attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
 
-    attn_output_weights = softmax(attn_output_weights, dim=-1)
+    if softmax_dtype is not None and attn_output_weights.dtype != softmax_dtype:
+        _orig_dtype = attn_output_weights.dtype
+        attn_output_weights = softmax(attn_output_weights.to(softmax_dtype), dim=-1)
+        attn_output_weights = attn_output_weights.to(_orig_dtype)
+    else:
+        attn_output_weights = softmax(attn_output_weights, dim=-1)
     attn_output_weights = dropout(attn_output_weights, p=dropout_p, training=training)
     if attn_weights_fake_quant is not None:
         attn_output_weights = attn_weights_fake_quant(attn_output_weights)

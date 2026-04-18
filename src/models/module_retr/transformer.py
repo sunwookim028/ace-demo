@@ -140,6 +140,10 @@ class ConditionalTransformerEncoderLayer(nn.Module):
         # Set by register_attention_weights_quant_hooks(); None = disabled.
         self.attn_weights_fake_quant = None
 
+        # Optional dtype override for the softmax compute (see attention.py).
+        # Set by register_fp32_softmax_hooks(); None = let autocast decide.
+        self.softmax_dtype = None
+
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
@@ -198,6 +202,7 @@ class ConditionalTransformerEncoderLayer(nn.Module):
             out_dim=q.shape[-1],
             qkv_fake_quant=self.qkv_fake_quant,
             attn_weights_fake_quant=self.attn_weights_fake_quant,
+            softmax_dtype=self.softmax_dtype,
         )[0][:, :, :n_model]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
